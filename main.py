@@ -1,93 +1,121 @@
+# Import necessary libraries
 import pandas as pd
-from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-from category_encoders import TargetEncoder
-from xgboost import XGBClassifier
-from sklearn.compose import ColumnTransformer
+from catboost import CatBoostClassifier
+from sklearn.preprocessing import OrdinalEncoder
+import numpy as np
 
-# Load the data
-train_df = pd.read_csv('training.csv')
-test_df = pd.read_csv('test.csv')
+# Load data
+train = pd.read_csv('training.csv')
+test = pd.read_csv('test.csv')
 
-# Separate features (X) and target variable (y)
-X = train_df.iloc[:, 1:-1]
-y = train_df.iloc[:, -1]
+# Drop 'patient_id' column
+train.drop(columns=['patient_id'], inplace=True)
+test.drop(columns=['patient_id'], inplace=True)
 
-# Identify numeric and non-numeric columns
-numeric_cols = X.select_dtypes(include=['number']).columns
-non_numeric_cols = X.select_dtypes(exclude=['number']).columns
+# Define function to handle missing values
+def impute_categorical(df, columns):
+    """Impute missing values in categorical columns using mode."""
+    mode_values = df[columns].mode().iloc[0]
+    df[columns] = df[columns].fillna(mode_values)
+    return df
 
-# Preprocessing pipelines
-numeric_transformer = Pipeline([
-    ('imputer', SimpleImputer(strategy='median')),
-    ('scaler', StandardScaler())
-])
+def impute_numerical(df, columns):
+    """Impute missing values in numerical columns using median."""
+    median_values = df[columns].median()
+    df[columns] = df[columns].fillna(median_values)
+    return df
 
-categorical_transformer = Pipeline([
-    ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
-    ('target_encoder', TargetEncoder())
-])
+def handle_missing_values(df):
+    """Handle missing values in a DataFrame."""
+    # Identify categorical and numerical columns
+    categorical_columns = df.select_dtypes(include=['object']).columns
+    numerical_cols = df.select_dtypes(exclude=['object']).columns
 
-preprocessor = ColumnTransformer(
-    transformers=[
-        ('num', numeric_transformer, numeric_cols),
-        ('cat', categorical_transformer, non_numeric_cols)
-    ])
+    # Impute missing values
+    df = impute_categorical(df, categorical_columns)
+    df = impute_numerical(df, numerical_cols)
 
-# Classifier pipeline
-xgb_pipeline = Pipeline([
-    ('preprocessor', preprocessor),
-    ('xgb', XGBClassifier(random_state=69))
-])
+    return df
 
-# Define the parameter grid for hyperparameter tuning
-param_grid = {
-    'xgb__learning_rate': [0.05],
-    'xgb__max_depth': [3, 5],
-    'xgb__min_child_weight': [1, 5],
-    'xgb__subsample': [0.8],
-    'xgb__colsample_bytree': [0.8],
-    'xgb__gamma': [0],
-    'xgb__reg_alpha': [0],
-    'xgb__reg_lambda': [0],
-    'xgb__scale_pos_weight': [1]  # Adjust for class imbalance if necessary
+# Handle missing values in train and test data
+handle_missing_values(train)
+handle_missing_values(test)
+
+# Combine train and test data
+test['DiagPeriodL90D'] = 2
+df = pd.concat([train, test])
+
+# Encode categorical columns
+encoder = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+categorical_columns = df.select_dtypes(include=['object']).columns
+df[categorical_columns] = encoder.fit_transform(df[categorical_columns])
+
+# Define columns for training
+cols = ['breast_cancer_diagnosis_code', 'metastatic_cancer_diagnosis_code', 'patient_zip3', 'patient_age', 'payer_type',
+        'patient_state', 'breast_cancer_diagnosis_desc']
+
+# Separate train and test data
+train = df[df['DiagPeriodL90D'] != 2]
+test = df[df['DiagPeriodL90D'] == 2].drop(columns=['DiagPeriodL90D'])
+
+# Initialize AUC scores and test predictions
+auc_scores = []
+test_preds = []  # Change to list
+
+# Cross-validation settings
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+# Model parameters
+params = {
+    'depth': 2,
+    'random_state': 42,
+    'eval_metric': 'AUC',
+    'verbose': False,
+    'loss_function': 'Logloss',
+    'learning_rate': 0.3,
+    'iterations': 1000
 }
 
-# Grid search
-grid_search = GridSearchCV(estimator=xgb_pipeline, param_grid=param_grid, cv=3, scoring='roc_auc', verbose=3, n_jobs=-1)
+X = train[cols]
+y = train['DiagPeriodL90D']
 
-# Split data
-X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.1, random_state=42)
+# Perform cross-validation and predict
+for train_indices, test_indices in cv.split(X, y):
+    X_train, X_test = X.iloc[train_indices], X.iloc[test_indices]
+    y_train, y_test = y.iloc[train_indices], y.iloc[test_indices]
 
-# Fit GridSearchCV
-grid_search.fit(X_train, y_train)
+    # Initialize CatBoost classifier
+    model = CatBoostClassifier(**params)
 
-# Best parameters and score
-best_params = grid_search.best_params_
-best_score = grid_search.best_score_
+    # Train the model
+    model.fit(X_train, y_train, eval_set=(X_test, y_test), use_best_model=True)
 
-# Best model
-best_model = grid_search.best_estimator_
-y_val_pred_proba = best_model.predict_proba(X_val)[:, 1]
+    # Make predictions on the test set
+    preds = model.predict_proba(X_test)[:, 1]
+    preds_test = model.predict_proba(test[cols])[:, 1]
+    test_preds.append(preds_test)  # Append directly to list
 
-# AUC score on the validation set
-auc_score = roc_auc_score(y_val, y_val_pred_proba)
+    # Calculate AUC score
+    auc_score = roc_auc_score(y_test, preds)
+    auc_scores.append(auc_score)
+    print(f"AUC Score: {auc_score}")
 
-print(f'Best Parameters: {best_params}')
-print(f'AUC score on the validation set: {auc_score}')
+# Print average AUC score
+print(f"Average AUC Score: {np.mean(auc_scores)}")
 
-# Predictions on the test set
-print("Making predictions on the test set...")
-predictions_test_proba = best_model.predict_proba(test_df.iloc[:, 1:])[:, 1]
-print("Predictions completed.")
+# Combine predictions from different folds
+ensemble_preds = np.mean(test_preds, axis=0)
 
-# Write predicted probabilities to a text file using index as IDs
-print("Writing predicted probabilities to file...")
-with open('SampleSolution.txt', 'w') as file:
-    for index, prob in zip(test_df.iloc[:, 0], predictions_test_proba):
-        file.write(f'{index},{prob}\n')
+# Prepare submission file
+submission = pd.DataFrame()
 
-print("Writing to file completed.")
+# Reset the index of the submission DataFrame
+submission = submission.reset_index(drop=True)
+
+# Assign predictions to the 'DiagPeriodL90D' column
+submission['DiagPeriodL90D'] = ensemble_preds
+
+# Save the submission file
+submission.to_csv('submission.csv', index=False)
